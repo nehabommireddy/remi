@@ -1,0 +1,32 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+ENV/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# Build artifacts
+build/
+dist/
+out/
+*.egg-info/
+
+# Model files
+*.bin
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.ckpt
