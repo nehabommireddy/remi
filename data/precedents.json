@@ -1,514 +1,366 @@
 [
   {
-    "id": "precedent-001",
-    "title": "API returning intermittent 504s under heavy load",
-    "problem": "The Payments team saw authorization requests time out once traffic exceeded roughly 800 requests/sec after adding a fraud check.",
-    "symptoms": "Gateway 504s reached 8%; p95 was 5.0s while application CPU stayed below 40%. HikariCP showed 40 active connections, zero idle, and acquire p95 of 4.6s; logs reported connection acquisition timed out.",
-    "root_cause": "A Spring transaction acquired a PostgreSQL connection before a remote fraud call and held it for up to 2s. The 40-connection pool saturated despite low database CPU.",
+    "id": "payments-api-001",
+    "title": "Intermittent 504s under traffic spikes from leaked database connections",
+    "problem": "Payment authorization requests timed out during traffic spikes.",
+    "symptoms": "Intermittent HTTP 504s under heavy load; the summary identifies connection leakage after errors but supplies no latency, error-rate, or pool-utilization measurements.",
+    "root_cause": "Error paths failed to release PostgreSQL connections to the bounded psycopg pool, exhausting available connections.",
     "attempted_solutions": [
       {
-        "solution": "Raised the gateway timeout from 5s to 30s.",
-        "result": "Visible 504s fell temporarily, but queued requests and connection waits grew; the change concealed exhaustion."
-      },
-      {
-        "solution": "Increased each pod pool from 40 to 80.",
-        "result": "Eight pods exceeded the database connection budget during rollout, introducing too many clients errors."
+        "solution": "Increased the HTTP timeout.",
+        "result": "Failed to correct the connection leak; requests still depended on connections that were not returned."
       }
     ],
-    "successful_solution": "Moved the fraud request outside the database transaction, kept only ledger writes inside it, restored 40 connections per pod, and bounded request concurrency to the measured database budget.",
-    "outcome": "Issue load-test attachment showed 504s falling from 8% to 0.2% at 1,000 requests/sec, p95 from 5.0s to 310ms, and connection acquire p95 below 20ms over a 45-minute run.",
-    "applicable_when": "An API times out under concurrency with saturated connection pools, low database CPU, and transactions spanning network calls; applicable to checkout and other transactional services.",
+    "successful_solution": "Implemented proper connection cleanup, bounded connection waiting, and pool monitoring.",
+    "outcome": "The summary reports the underlying cause was addressed and all nine repository tests passed in GitHub CI; no before/after load-test figures were supplied. Evidence: supplied repository summary; no incident commit or issue identifier was supplied. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "Traffic-spike timeouts coincide with connections not being returned after failures. Compare checkout-service provider timeouts and payments-api migration blocking before applying this fix.",
     "repository": "payments-api",
-    "source": "github_issue",
-    "source_url": "https://github.com/copperlane-labs/payments-api/issues/184",
-    "verified": true
-  },
-  {
-    "id": "precedent-002",
-    "title": "Checkout 504s caused by a slow payment provider",
-    "problem": "The Commerce team saw intermittent checkout 504s at the evening sales peak even though order database queries remained fast.",
-    "symptoms": "504 rate reached 6%, checkout p95 hit the 5s gateway deadline, and traces spent 4.7s in the payment-provider span. Database pool utilization stayed below 35% and connection acquisition below 5ms.",
-    "root_cause": "The external authorization provider degraded to 4-8s responses; the client had an 8s timeout and occupied request workers beyond the gateway deadline.",
-    "attempted_solutions": [
-      {
-        "solution": "Doubled the order database connection pool.",
-        "result": "Latency did not change because requests were waiting on the provider, not PostgreSQL."
-      },
-      {
-        "solution": "Retried every provider timeout immediately.",
-        "result": "Provider traffic rose 70% and worsened throttling; uncertain authorizations required reconciliation."
-      }
-    ],
-    "successful_solution": "Set a 2s provider deadline and circuit breaker, reused a durable idempotency key, and returned a pending-payment state for uncertain authorizations that a reconciliation worker resolved.",
-    "outcome": "PR canary report recorded gateway 504s falling from 6% to 0.3% and checkout p95 to 2.2s; 2.1% of payments remained pending, with 98% reconciled within two minutes.",
-    "applicable_when": "504s align with downstream spans while local pools and queries are healthy; useful for payments, shipping, and other external-service calls.",
-    "repository": "checkout-service",
-    "source": "github_pr",
-    "source_url": "https://github.com/copperlane-labs/checkout-service/pull/327",
-    "verified": true
-  },
-  {
-    "id": "precedent-003",
-    "title": "Profile API slows under traffic spikes despite available connections",
-    "problem": "The Identity team saw profile search become unusable above 600 requests/sec as the tenant directory passed 12 million records.",
-    "symptoms": "p95 increased from 240ms to 3.8s, with 1.5% gateway 504s. PostgreSQL CPU reached 92%; pool acquisition stayed below 15ms, and EXPLAIN showed sequential scans for tenant_id plus lower(email).",
-    "root_cause": "The existing email index could not support the case-insensitive, tenant-scoped lookup, so each request scanned millions of rows.",
-    "attempted_solutions": [
-      {
-        "solution": "Increased API workers from 8 to 16.",
-        "result": "Database CPU stayed saturated and query concurrency increased."
-      },
-      {
-        "solution": "Added an index on email alone.",
-        "result": "The lower(email) predicate still prevented use of that index and tenant filtering remained expensive."
-      }
-    ],
-    "successful_solution": "Created a concurrent composite expression index on (tenant_id, lower(email)), refreshed statistics, and confirmed the production query used an index scan.",
-    "outcome": "Issue query plans and a one-hour replay showed p95 dropping from 3.8s to 180ms, database CPU to 48%, and 504s below 0.1%; bulk directory exports remained slow.",
-    "applicable_when": "Latency rises with table size and database CPU, but connection acquisition is fast; relevant to tenant-scoped search in checkout and analytics.",
-    "repository": "user-service",
-    "source": "github_issue",
-    "source_url": "https://github.com/copperlane-labs/user-service/issues/219",
-    "verified": true
-  },
-  {
-    "id": "precedent-004",
-    "title": "Search 504s caused by expensive wildcard queries",
-    "problem": "The Discovery team saw search timeouts during a product launch after enabling substring matching on SKU fields.",
-    "symptoms": "Gateway 504s reached 4%; search p95 was 5.0s. OpenSearch search threads queued 1,200 tasks, node CPU hit 95%, and the slow log repeatedly contained leading-wildcard queries.",
-    "root_cause": "Queries such as *adapter* expanded across high-cardinality keyword terms and consumed the search cluster CPU; the API itself was healthy.",
-    "attempted_solutions": [
-      {
-        "solution": "Added two API replicas.",
-        "result": "Search-node utilization and timeouts did not improve because the bottleneck was downstream query execution."
-      }
-    ],
-    "successful_solution": "Built an n-gram search field in a replacement index, switched substring queries to that field, capped query length, and rate-limited the expensive legacy path during reindexing.",
-    "outcome": "PR benchmark showed p95 falling from 5.0s to 460ms and 504s to 0.2% at the same request rate; index storage increased 28%.",
-    "applicable_when": "Timeouts coincide with search-engine CPU and wildcard slow logs rather than database pool waits; relevant to catalog and analytics search.",
-    "repository": "search-service",
-    "source": "github_pr",
-    "source_url": "https://github.com/copperlane-labs/search-service/pull/91",
-    "verified": true
-  },
-  {
-    "id": "precedent-005",
-    "title": "Redis outage turns cart reads into a database stampede",
-    "problem": "The Commerce team lost the cart Redis primary during a failover rehearsal and overloaded PostgreSQL within 30 seconds.",
-    "symptoms": "Redis connection errors reached 100% for 42s, database reads rose from 2,000 to 18,000/sec, and cart p95 increased from 90ms to 2.6s.",
-    "root_cause": "Every cache miss fell back independently to the database, including thousands of simultaneous reads for the same promoted carts; Redis reconnects had no backoff.",
-    "attempted_solutions": [
-      {
-        "solution": "Increased the Redis client timeout from 100ms to 1s.",
-        "result": "Requests waited longer on the failed primary and still flooded the database afterward."
-      }
-    ],
-    "successful_solution": "Added per-key request coalescing, jittered reconnect backoff, a cache circuit breaker, and a strict concurrency cap on database fallback; returned retryable errors when the cap was full.",
-    "outcome": "Issue failover replay kept database reads below 4,500/sec and cart p95 at 380ms; 0.8% of reads received retryable errors during the 40s outage.",
-    "applicable_when": "Cache failure multiplies backend reads; transferable to user profiles and search metadata, with stale serving only where business semantics permit.",
-    "repository": "checkout-service",
-    "source": "github_issue",
-    "source_url": "https://github.com/copperlane-labs/checkout-service/issues/402",
-    "verified": true
-  },
-  {
-    "id": "precedent-006",
-    "title": "Report joins spill to disk after statistics drift",
-    "problem": "The Insights team saw daily account reports grow from 12s to more than three minutes after a large backfill.",
-    "symptoms": "EXPLAIN ANALYZE estimated 8,000 rows but processed 9 million, hash joins spilled 6GB to temporary files, and dashboard requests frequently exceeded the 60s deadline.",
-    "root_cause": "Bulk ingestion changed tenant data distribution faster than automatic analyze ran, causing a poor join order and undersized hash estimates.",
-    "attempted_solutions": [
-      {
-        "solution": "Doubled report worker memory.",
-        "result": "PostgreSQL still chose the same poor plan; application memory did not change database planning."
-      }
-    ],
-    "successful_solution": "Ran targeted ANALYZE, increased statistics targets on skewed tenant columns, and added an analyze step after large backfills with query-plan regression monitoring.",
-    "outcome": "Commit validation recorded report runtime falling from 184s to 19s and temporary writes from 6GB to 140MB; the largest tenant still took 43s.",
-    "applicable_when": "Queries degrade immediately after bulk data changes and estimated row counts diverge from actual counts; useful across reporting and pipeline repositories.",
-    "repository": "analytics-platform",
-    "source": "github_commit",
-    "source_url": "https://github.com/copperlane-labs/analytics-platform/commit/a9c4e281f63d5078b124eaf690c83d75219bf406",
-    "verified": true
-  },
-  {
-    "id": "precedent-007",
-    "title": "Worker memory leak from retained delivery listeners",
-    "problem": "The Messaging team found Node.js email workers restarting every four hours even with stable throughput.",
-    "symptoms": "RSS rose from 220MB to the 1GB container limit; heap snapshots showed DeliveryTracker objects retained by EventEmitter listeners and logs contained MaxListenersExceededWarning.",
-    "root_cause": "Each send registered a delivery listener but the timeout path never removed it, retaining the message payload and closure indefinitely.",
-    "attempted_solutions": [
-      {
-        "solution": "Raised the container memory limit to 2GB.",
-        "result": "Restarts moved to roughly eight hours, confirming that the retained object growth continued."
-      }
-    ],
-    "successful_solution": "Removed listeners in a finally block on success, timeout, and cancellation, and bounded the number of in-flight deliveries.",
-    "outcome": "PR soak-test evidence showed RSS between 230MB and 310MB for 24 hours at 200 messages/sec, with no OOM restarts; normal GC pauses remained.",
-    "applicable_when": "Memory grows monotonically with completed work and heap retainers point to listeners or callbacks; applicable to event-driven API and job workers.",
-    "repository": "notification-service",
-    "source": "github_pr",
-    "source_url": "https://github.com/copperlane-labs/notification-service/pull/156",
-    "verified": true
-  },
-  {
-    "id": "precedent-008",
-    "title": "CPU spikes from repeated route-pattern compilation",
-    "problem": "The Web Experience team saw the server-rendered storefront slow dramatically after introducing tenant-specific redirects.",
-    "symptoms": "Node CPU hit one full core per process at 120 requests/sec; SSR p95 rose from 180ms to 1.9s while network and database spans stayed short. Profiles attributed 68% of CPU to RegExp construction.",
-    "root_cause": "The redirect middleware compiled all 4,000 tenant route patterns on every request instead of reusing compiled patterns.",
-    "attempted_solutions": [
-      {
-        "solution": "Added response compression tuning.",
-        "result": "CPU profiles and p95 were unchanged because regex compilation dominated before rendering."
-      }
-    ],
-    "successful_solution": "Compiled redirect patterns once per configuration version and stored them in a size-bounded tenant cache invalidated on configuration changes.",
-    "outcome": "Issue replay reduced SSR p95 from 1.9s to 260ms and CPU per request by 61%; cold tenant configuration loads still took about 500ms.",
-    "applicable_when": "CPU-bound request latency with healthy downstream services and repeated parsing or compilation in profiles; useful for gateway routing and policy engines.",
-    "repository": "frontend-platform",
-    "source": "github_issue",
-    "source_url": "https://github.com/copperlane-labs/frontend-platform/issues/73",
-    "verified": true
-  },
-  {
-    "id": "precedent-009",
-    "title": "Kafka lag grows because enrichment blocks the poll loop",
-    "problem": "The Data Engineering team saw shipment enrichment fall 40 minutes behind during a supplier API slowdown.",
-    "symptoms": "Consumer lag reached 1.8 million records, poll intervals exceeded max.poll.interval.ms, and repeated partition revocations appeared while enrichment calls took 3-6s each.",
-    "root_cause": "Synchronous HTTP enrichment inside the Kafka poll loop prevented timely polling and triggered rebalances, repeatedly discarding unfinished batches.",
-    "attempted_solutions": [
-      {
-        "solution": "Raised max.poll.interval.ms to 15 minutes.",
-        "result": "Rebalances became less frequent but throughput stayed below ingestion, so lag kept growing."
-      }
-    ],
-    "successful_solution": "Decoupled polling from bounded enrichment workers, paused partitions under backpressure, preserved per-partition completion order, and committed only contiguous completed offsets.",
-    "outcome": "PR replay drained 1.8 million records in 52 minutes with no poll-timeout rebalances; steady-state lag stayed below 8,000 records during a four-hour test.",
-    "applicable_when": "Kafka lag accompanies slow per-record I/O and poll-timeout rebalances; applicable to notification and analytics consumers.",
-    "repository": "data-pipeline",
-    "source": "github_pr",
-    "source_url": "https://github.com/copperlane-labs/data-pipeline/pull/268",
-    "verified": true
-  },
-  {
-    "id": "precedent-010",
-    "title": "Duplicate settlement events credit the ledger twice",
-    "problem": "The Ledger team found 37 duplicate credits after a settlement consumer restarted during broker maintenance.",
-    "symptoms": "Two ledger rows shared each provider_event_id, and logs showed a crash after transaction commit but before the Kafka offset commit.",
-    "root_cause": "At-least-once delivery replayed committed events, and the consumer had no durable deduplication inside the ledger transaction.",
-    "attempted_solutions": [
-      {
-        "solution": "Enabled Kafka producer idempotence.",
-        "result": "Replayed consumer records still created duplicate ledger rows; producer deduplication did not cover database side effects."
-      }
-    ],
-    "successful_solution": "Added a unique (provider, provider_event_id) receipt written in the same transaction as the credit, treated conflicts as already processed, and reconciled the 37 historical duplicates.",
-    "outcome": "Issue evidence included a 100,000-event replay with injected crashes that produced zero additional credits; reconciliation accounted for all 37 duplicate postings.",
-    "applicable_when": "An event can be redelivered after a database commit; relevant to checkout, notification, and pipeline consumers performing durable side effects.",
-    "repository": "payments-api",
-    "source": "github_issue",
-    "source_url": "https://github.com/copperlane-labs/payments-api/issues/251",
-    "verified": true
-  },
-  {
-    "id": "precedent-011",
-    "title": "Rolling deployments fail during slow application startup",
-    "problem": "The Runtime team could not roll out a new JVM order worker image without repeated pod restarts.",
-    "symptoms": "Pods restarted at 30s with liveness probe failures, but local startup required 65-80s to load validation rules; rollout progress deadlines expired.",
-    "root_cause": "Liveness probes started before legitimate initialization finished, killing otherwise healthy containers before they could become ready.",
-    "attempted_solutions": [
-      {
-        "solution": "Increased the deployment progress deadline to 20 minutes.",
-        "result": "Pods still restarted every 30s, so the rollout simply failed later."
-      }
-    ],
-    "successful_solution": "Added a startup probe allowing up to 120s, kept readiness false until initialization completed, and retained a short liveness threshold after startup.",
-    "outcome": "PR rollout logs showed 12 consecutive successful deployments with zero startup restarts; rollout duration remained about three minutes.",
-    "applicable_when": "Containers are killed at a repeatable interval during initialization and eventually start outside Kubernetes; transferable to any service with expensive startup.",
-    "repository": "infrastructure",
-    "source": "github_pr",
-    "source_url": "https://github.com/copperlane-labs/infrastructure/pull/118",
-    "verified": true
-  },
-  {
-    "id": "precedent-012",
-    "title": "CI install fails because Node versions differ",
-    "problem": "The Developer Experience team saw clean frontend builds fail only on the shared CI runner after a package upgrade.",
-    "symptoms": "npm ci exited with EBADENGINE: a build dependency required Node >=20 while CI used Node 18. Local machines on Node 20 built successfully.",
-    "root_cause": "The repository declared no enforced runtime version and the CI image tag still resolved to the older major version.",
-    "attempted_solutions": [
-      {
-        "solution": "Deleted the npm download cache and reran the workflow.",
-        "result": "The engine error reproduced before compilation because cached packages were not the cause."
-      }
-    ],
-    "successful_solution": "Pinned Node 20.11.1 in CI and the local version file, declared the supported engine range, and added an early runtime-version check to the build script.",
-    "outcome": "Commit checks showed 20 consecutive clean installs passing on fresh runners; the early check produced a clear error on the old runtime.",
-    "applicable_when": "CI-only dependency failures correlate with runtime versions rather than source changes; useful for frontend and Node-based service repositories.",
-    "repository": "frontend-platform",
-    "source": "github_commit",
-    "source_url": "https://github.com/copperlane-labs/frontend-platform/commit/d438fa2c196be8075a41c9dfe083b26794ad510e",
-    "verified": true
-  },
-  {
-    "id": "precedent-013",
-    "title": "Valid JWTs rejected after signing-key rotation",
-    "problem": "The Identity team rotated the token signing key and observed intermittent 401s from internal APIs for newly issued tokens.",
-    "symptoms": "401s affected 18% of requests; failing pods logged unknown kid while tokens validated on newly restarted pods. Their JWKS caches were 24 hours old.",
-    "root_cause": "Verifiers only refreshed JWKS on the daily timer and never refreshed on an unknown key ID, so long-lived pods could not recognize the new key.",
-    "attempted_solutions": [
-      {
-        "solution": "Extended token expiration from 15 to 60 minutes.",
-        "result": "New tokens still used the unrecognized signing key, so the rejection rate did not improve."
-      }
-    ],
-    "successful_solution": "Added a rate-limited refresh-on-unknown-kid path with single-flight fetching, shortened cache refresh to five minutes, and retained old public keys through the token validity window.",
-    "outcome": "Issue rotation rehearsal showed unknown-kid failures below 0.05%, resolved within five seconds; expired or invalid signatures continued to be rejected.",
-    "applicable_when": "Authentication failures depend on pod age or key rotation and log unknown key IDs; applicable to all services validating shared issuer tokens.",
-    "repository": "auth-service",
-    "source": "github_issue",
-    "source_url": "https://github.com/copperlane-labs/auth-service/issues/96",
-    "verified": true
-  },
-  {
-    "id": "precedent-014",
-    "title": "Concurrent purchases oversell the last inventory unit",
-    "problem": "The Commerce team accepted two orders for the final unit of a limited-edition product during a flash sale.",
-    "symptoms": "Race replay produced 11 oversells in 10,000 paired requests; each transaction read stock=1 before independently decrementing it.",
-    "root_cause": "The availability check and decrement were separate operations without row locking or an atomic conditional update.",
-    "attempted_solutions": [
-      {
-        "solution": "Disabled the frontend purchase button after the first click.",
-        "result": "Requests from separate shoppers still raced, so client-side prevention did not enforce inventory consistency."
-      }
-    ],
-    "successful_solution": "Replaced read-then-write with UPDATE inventory SET stock=stock-1 WHERE sku=? AND stock>0, required one affected row, and recorded the reservation in the same transaction with a unique order key.",
-    "outcome": "PR concurrency run accepted exactly one reservation for the last unit across 50,000 races; duplicate order retries returned the original reservation.",
-    "applicable_when": "A shared counter or quota is checked before a separate write; transferable to payments limits and notification quotas.",
-    "repository": "checkout-service",
-    "source": "github_pr",
-    "source_url": "https://github.com/copperlane-labs/checkout-service/pull/366",
-    "verified": true
-  },
-  {
-    "id": "precedent-015",
-    "title": "Ledger transfers deadlock when accounts are locked in opposite order",
-    "problem": "The Ledger team saw transfer failures rise when customers moved balances between the same pairs of accounts.",
-    "symptoms": "PostgreSQL reported 40P01 on 2.3% of transfers; deadlock graphs showed one transaction holding account A and waiting for B while another held B and waited for A.",
-    "root_cause": "Transactions locked the sender first and recipient second, creating opposing lock orders for reverse-direction transfers.",
-    "attempted_solutions": [
-      {
-        "solution": "Raised lock_timeout from 1s to 10s.",
-        "result": "PostgreSQL still detected the lock cycle and aborted a participant; longer waiting could not resolve the ordering bug."
-      }
-    ],
-    "successful_solution": "Locked both account rows in ascending account ID order across all transfer paths and retried deadlock-aborted transactions with bounded jitter and the original idempotency key.",
-    "outcome": "Commit stress results reduced deadlock failures from 2.3% to below 0.01% across one million bidirectional transfers; contention still raised hot-account p95 to 620ms.",
-    "applicable_when": "Deadlock graphs show transactions acquiring the same resources in different orders; useful for inventory reservations and multi-entity updates.",
-    "repository": "payments-api",
-    "source": "github_commit",
-    "source_url": "https://github.com/copperlane-labs/payments-api/commit/71be8cfa09d24635a891fb6c4e7d023af9851bc0",
-    "verified": true
-  },
-  {
-    "id": "precedent-016",
-    "title": "Background jobs remain stuck after worker termination",
-    "problem": "The Messaging team found scheduled SMS jobs permanently marked running after a node drain.",
-    "symptoms": "About 1,400 jobs were older than two hours although normal execution took under 10s; their owner pod IDs no longer existed and queue depth appeared normal.",
-    "root_cause": "The PostgreSQL-backed job runner changed status to running without a lease expiry or recovery path for crashed workers.",
-    "attempted_solutions": [
-      {
-        "solution": "Scaled the worker deployment from 4 to 12 pods.",
-        "result": "New workers selected only pending jobs, leaving orphaned running jobs untouched."
-      }
-    ],
-    "successful_solution": "Added expiring leases with heartbeats and fencing tokens, reclaimed expired jobs, and used the job ID as the SMS provider idempotency key to make uncertain sends safe to retry.",
-    "outcome": "Issue recovery audit reclaimed all 1,400 jobs in 18 minutes; a subsequent termination drill recovered work within 90s with no duplicate provider sends.",
-    "applicable_when": "Jobs remain running after their workers disappear; useful for any durable queue with application-managed ownership.",
-    "repository": "notification-service",
-    "source": "github_issue",
-    "source_url": "https://github.com/copperlane-labs/notification-service/issues/203",
-    "verified": true
-  },
-  {
-    "id": "precedent-017",
-    "title": "Partner API ingestion stalls on rate-limit responses",
-    "problem": "The Integrations team doubled ingestion workers and saw account synchronization take longer instead of finishing sooner.",
-    "symptoms": "Partner responses were 62% HTTP 429, Retry-After was usually 30s, and synchronization p95 rose from 8 to 47 minutes.",
-    "root_cause": "Each worker independently assumed it could use the entire account-level request quota and retried immediately after a 429.",
-    "attempted_solutions": [
-      {
-        "solution": "Added four more workers to clear the backlog.",
-        "result": "The shared quota was exceeded more often and useful throughput fell another 20%."
-      }
-    ],
-    "successful_solution": "Introduced a shared per-account token bucket, honored Retry-After, used jittered backoff, and scheduled accounts fairly so a large tenant could not consume every slot.",
-    "outcome": "PR partner-response logs showed 429s falling to 1.8% and sync p95 to 11 minutes; large initial imports still required several quota windows.",
-    "applicable_when": "More parallelism reduces throughput against a shared external quota; relevant to email, payment-provider, and data-import clients.",
-    "repository": "analytics-platform",
-    "source": "github_pr",
-    "source_url": "https://github.com/copperlane-labs/analytics-platform/pull/144",
-    "verified": true
-  },
-  {
-    "id": "precedent-018",
-    "title": "Profile cache resurrects old data after an update",
-    "problem": "The Identity team received reports that saved display names briefly reverted across devices.",
-    "symptoms": "Roughly 0.7% of profile edits returned the old value for up to ten minutes. Traces showed a slow reader filling Redis immediately after the writer deleted the cache key.",
-    "root_cause": "A reader fetched the old database row before the update committed, then repopulated the invalidated cache afterward; deletion alone did not order concurrent fills.",
-    "attempted_solutions": [
-      {
-        "solution": "Reduced the cache TTL from ten minutes to one minute.",
-        "result": "The stale interval shrank, but the race still occurred and database read load increased."
-      }
-    ],
-    "successful_solution": "Included a monotonic profile version in cache values and used an atomic Redis script to reject older fills; committed updates emitted durable outbox invalidations that advanced a version watermark.",
-    "outcome": "Issue race test rejected every delayed old-version fill in 50,000 schedules; production stale-read reports fell below 0.02%, with outbox delay still allowing brief staleness.",
-    "applicable_when": "Cache values revert after successful writes because in-flight reads refill old state; useful for catalog and notification preference caches.",
-    "repository": "user-service",
-    "source": "github_issue",
-    "source_url": "https://github.com/copperlane-labs/user-service/issues/281",
-    "verified": true
-  },
-  {
-    "id": "precedent-019",
-    "title": "Schema migration blocks writes on a large events table",
-    "problem": "The Data Engineering team deployed an events-column type change during active ingestion and blocked writers for nine minutes.",
-    "symptoms": "Insert p95 exceeded 30s, pg_locks showed an ACCESS EXCLUSIVE lock, and a table rewrite was running on 480GB of historical events.",
-    "root_cause": "The migration changed text to jsonb in place, requiring a long rewrite while holding a lock incompatible with ingestion.",
-    "attempted_solutions": [
-      {
-        "solution": "Increased the migration statement timeout to one hour.",
-        "result": "The operation could run longer, but it continued blocking writes and exceeded the ingestion availability budget."
-      }
-    ],
-    "successful_solution": "Cancelled and rolled back the blocking migration, added a nullable jsonb column with a short lock timeout, dual-wrote new events, backfilled in throttled batches, and switched reads after validating counts and conversion errors.",
-    "outcome": "PR migration log showed backfill finishing in 31 hours with insert p95 below 180ms; 0.04% invalid JSON rows were quarantined for correction before retiring the old column.",
-    "applicable_when": "A schema change rewrites a large active table or needs a prolonged exclusive lock; transferable to payments and user data migrations.",
-    "repository": "data-pipeline",
-    "source": "github_pr",
-    "source_url": "https://github.com/copperlane-labs/data-pipeline/pull/305",
-    "verified": true
-  },
-  {
-    "id": "precedent-020",
-    "title": "Indexer containers crash on oversized bulk batches",
-    "problem": "The Discovery team saw indexer pods crash whenever a nightly catalog import contained unusually large product descriptions.",
-    "symptoms": "Pods ended with OOMKilled and exit code 137 during bulk serialization; RSS jumped from 350MB to 1.5GB in seconds, then reset after restart.",
-    "root_cause": "The batcher capped document count at 5,000 but not bytes, and simultaneously retained object payloads and the serialized HTTP request body.",
-    "attempted_solutions": [
-      {
-        "solution": "Forced garbage collection between batches.",
-        "result": "The oversized live batch still exceeded the container limit before it could be sent or collected."
-      }
-    ],
-    "successful_solution": "Capped batches by encoded bytes and document count, limited concurrent bulk requests to two, and routed individually oversized documents to an explicit rejection queue.",
-    "outcome": "Issue replay indexed the full import with peak RSS of 620MB under a 1GB limit; 19 oversized documents required manual content cleanup.",
-    "applicable_when": "Memory jumps during a specific large batch rather than growing across many completed batches; relevant to exports and notification bulk sends.",
-    "repository": "search-service",
-    "source": "github_issue",
-    "source_url": "https://github.com/copperlane-labs/search-service/issues/132",
-    "verified": true
-  },
-  {
-    "id": "precedent-021",
-    "title": "Dependency upgrade breaks password verification at startup",
-    "problem": "The Identity team upgraded the Python dependency lock and found login workers failing before serving traffic.",
-    "symptoms": "Containers logged AttributeError referencing a removed bcrypt module attribute when the password adapter initialized; the previous lockfile image started successfully.",
-    "root_cause": "The legacy password adapter depended on an internal bcrypt attribute removed by the newly resolved version, despite permissive dependency constraints.",
-    "attempted_solutions": [
-      {
-        "solution": "Rebuilt the image without Docker layer caching.",
-        "result": "The same locked versions reproduced the failure, ruling out stale build layers."
-      }
-    ],
-    "successful_solution": "Restored the last compatible bcrypt pin as an immediate recovery, then replaced the adapter with a maintained integration and verified existing hash fixtures before upgrading again.",
-    "outcome": "Commit checks verified 2,000 representative existing password hashes and new-hash round trips; the canary served login traffic for 24 hours without adapter exceptions.",
-    "applicable_when": "A dependency update breaks initialization or runtime integration despite passing installation; useful for backend SDK and framework upgrades.",
-    "repository": "auth-service",
-    "source": "github_commit",
-    "source_url": "https://github.com/copperlane-labs/auth-service/commit/8f3c21be5d09746a8bc2e10379f46da5120ec8ab",
-    "verified": true
-  },
-  {
-    "id": "precedent-022",
-    "title": "Checkout UI rejects a valid changed API response",
-    "problem": "The Web Experience team deployed a backend checkout response update and saw successful orders displayed as failures.",
-    "symptoms": "The API returned 201, but 7% of browser sessions logged Cannot read properties of undefined reading amount; only clients expecting total.amount were affected.",
-    "root_cause": "The backend replaced the nested total object with total_minor without a compatibility period, while old JavaScript bundles remained cached on client devices.",
-    "attempted_solutions": [
-      {
-        "solution": "Purged the CDN JavaScript cache.",
-        "result": "Already open tabs and cached service-worker bundles still used the old contract, so errors continued."
-      }
-    ],
-    "successful_solution": "Restored total alongside total_minor, deployed a client that accepted both forms, added consumer contract fixtures, and removed the old field only after supported client telemetry showed migration complete.",
-    "outcome": "PR browser replay passed for old and new bundles; checkout rendering errors fell from 7% to 0.1% while successful order creation remained unchanged.",
-    "applicable_when": "HTTP success is followed by client parse or rendering errors after a schema change; applicable to mobile and service-to-service consumers with independent deployments.",
-    "repository": "frontend-platform",
-    "source": "github_pr",
-    "source_url": "https://github.com/copperlane-labs/frontend-platform/pull/188",
-    "verified": true
-  },
-  {
-    "id": "precedent-023",
-    "title": "Missing trace propagation hides the source of intermittent latency",
-    "problem": "The Runtime team spent two incidents guessing why order submission occasionally took three seconds across checkout, auth, and shipping services.",
-    "symptoms": "Aggregate endpoint metrics showed p99 of 3.2s, but logs had unrelated request IDs and traces ended at the checkout boundary; no downstream timing could be attributed to the slow requests.",
-    "root_cause": "The HTTP client wrapper dropped traceparent headers and instrumentation excluded outbound requests, leaving a diagnostic gap rather than evidence of a specific performance cause.",
-    "attempted_solutions": [
-      {
-        "solution": "Enabled debug logging on every service.",
-        "result": "Log volume tripled without shared correlation IDs, so engineers still could not reconstruct an individual slow request."
-      }
-    ],
-    "successful_solution": "Instrumented inbound and outbound HTTP, propagated W3C trace context through the client wrapper, attached trace IDs to structured logs, and retained slow traces with collector tail sampling.",
-    "outcome": "Reviewed incident-drill notes showed time to isolate a delayed shipping hop dropping from 75 to 12 minutes; p99 remained 3.2s because instrumentation itself did not fix latency.",
-    "applicable_when": "Latency crosses service boundaries but evidence cannot identify the responsible hop; useful before selecting a database, cache, or downstream-service fix.",
-    "repository": "infrastructure",
     "source": "manual",
-    "source_url": "https://runbooks.copperlane.example/reviews/trace-propagation-drill-2025-02",
+    "source_url": "",
     "verified": true
   },
   {
-    "id": "precedent-024",
-    "title": "Nested retries amplify a brief webhook outage",
-    "problem": "The Messaging team experienced a 15-minute backlog after a customer webhook endpoint failed for only 90 seconds.",
-    "symptoms": "Outbound attempts rose from 300 to 3,600/sec, worker utilization hit 100%, and the same delivery IDs appeared repeatedly in HTTP and queue retry logs.",
-    "root_cause": "The HTTP SDK retried three times inside each of four queue delivery attempts, multiplying retries without a shared attempt budget or jitter.",
+    "id": "payments-api-002",
+    "title": "Index migration blocks authorization writes",
+    "problem": "An index migration increased authorization API latency while PostgreSQL writes were blocked.",
+    "symptoms": "Write blocking and API latency during an index migration; no measured duration or error rate was supplied.",
+    "root_cause": "The index migration blocked database writes; increasing application capacity could not remove the database lock.",
     "attempted_solutions": [
       {
-        "solution": "Raised the worker concurrency from 50 to 200.",
-        "result": "More duplicate attempts reached the failing endpoint and the backlog expanded faster."
+        "solution": "Added API replicas.",
+        "result": "Failed because additional API processes still depended on the same blocked database writes."
       }
     ],
-    "successful_solution": "Made the queue the sole retry owner, disabled SDK retries, added exponential backoff with full jitter and a per-destination circuit breaker, and preserved delivery idempotency keys.",
-    "outcome": "Issue outage replay capped attempts at 480/sec and drained the backlog four minutes after recovery; 0.3% of deliveries exhausted the budget and entered the dead-letter queue.",
-    "applicable_when": "A short dependency failure causes traffic amplification and prolonged recovery through nested retries; transferable to payment and ingestion clients.",
-    "repository": "notification-service",
-    "source": "github_issue",
-    "source_url": "https://github.com/copperlane-labs/notification-service/issues/244",
-    "verified": true
-  },
-  {
-    "id": "precedent-025",
-    "title": "Service-to-service TLS fails after certificate renewal",
-    "problem": "The Commerce team lost shipping quotes immediately after the internal shipping endpoint renewed its certificate.",
-    "symptoms": "Quote calls returned 502 on 100% of checkout pods with x509: certificate signed by unknown authority; curl using the platform trust bundle succeeded and database metrics were normal.",
-    "root_cause": "The checkout image embedded an outdated private CA bundle, while the renewed shipping certificate chained to the new intermediate trusted by the platform bundle.",
-    "attempted_solutions": [
-      {
-        "solution": "Restarted checkout pods and flushed DNS.",
-        "result": "New pods loaded the same outdated image bundle and failed the same TLS handshake."
-      }
-    ],
-    "successful_solution": "Mounted the managed CA bundle into checkout, configured the HTTP client to use it, rebuilt pooled connections on bundle rotation, and added a staging handshake check for the next certificate chain.",
-    "outcome": "Reviewed rotation notes recorded shipping quote success returning to 99.8% within eight minutes; a second certificate rotation completed without trust failures.",
-    "applicable_when": "Internal calls fail during TLS negotiation after certificate rotation while DNS and service health remain good; relevant to every private-CA service client.",
-    "repository": "checkout-service",
+    "successful_solution": "Used concurrent index creation and migration safeguards documented in migration runbooks.",
+    "outcome": "The summary reports the migration cause was addressed. The repository has nine passing GitHub CI tests, but no migration benchmark or safeguard details were supplied. Evidence: supplied repository summary; no incident commit or issue identifier was supplied. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "Latency starts during an index migration and writes are blocked. Distinguish lock contention from leaked connections and downstream provider latency.",
+    "repository": "payments-api",
     "source": "manual",
-    "source_url": "https://runbooks.copperlane.example/reviews/shipping-ca-rotation-2025-03",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "checkout-service-001",
+    "title": "Provider-induced checkout 504s despite healthy database metrics",
+    "problem": "Checkout waited too long for the downstream mock payment provider.",
+    "symptoms": "Checkout 504s occurred with a slow downstream provider while database metrics remained healthy; the original provider timeout was 10 seconds.",
+    "root_cause": "The downstream provider was slow and the client allowed long waits; database connection exhaustion was not the cause.",
+    "attempted_solutions": [
+      {
+        "solution": "Increased the database pool.",
+        "result": "Did not help because the provider, rather than the database, was slow."
+      }
+    ],
+    "successful_solution": "Reduced the provider timeout to 600 milliseconds, initially limited the client to one attempt, and added a circuit breaker opening after three failures. A later retry fix allows at most two provider attempts.",
+    "outcome": "Timeout and breaker-recovery tests were added; all nine final checkout tests pass according to the summary. No production latency reduction was reported. Evidence: supplied repository summary identifies commit 661c873; merged PR #5; resolved issue #1. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "504s are attributable to downstream provider calls while database metrics are healthy; compare payments-api connection leakage before reusing a timeout fix.",
+    "repository": "checkout-service",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "checkout-service-002",
+    "title": "Two retry layers amplify provider failures to nine attempts",
+    "problem": "A failing provider triggered excessive attempts for each checkout.",
+    "symptoms": "The initial orchestration and provider-client retry layers could issue up to nine provider attempts per checkout.",
+    "root_cause": "Retries at both layers multiplied attempts rather than sharing a single retry owner.",
+    "attempted_solutions": [
+      {
+        "solution": "Increased worker concurrency.",
+        "result": "Made the retry storm worse by allowing more work against the failing provider."
+      },
+      {
+        "solution": "Retried in both checkout orchestration and the provider client.",
+        "result": "The original implementation amplified a single checkout into as many as nine provider attempts."
+      }
+    ],
+    "successful_solution": "Removed orchestration retries; made the provider client the sole retry owner with at most two attempts, jittered backoff, no retries for permanent errors, a limit of eight concurrent retries, and the same idempotency key.",
+    "outcome": "The documented maximum fell from nine provider attempts to two. The final repository suite has nine passing tests; no throughput measurements were supplied. Evidence: supplied repository summary identifies commit 6cacb36; merged PR #6; resolved issue #2. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "Nested retries amplify downstream outages. Relevant to payments-api callers, but retry ownership must be coordinated across layers.",
+    "repository": "checkout-service",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "checkout-service-003",
+    "title": "Repeated checkout requests return different order IDs",
+    "problem": "Clients retrying a checkout could receive a newly generated order instead of the original result.",
+    "symptoms": "The initial implementation generated a fresh order ID on every request; duplicate-request handling needed to survive reopening the database.",
+    "root_cause": "Successful normalized requests and responses were not durably associated with their idempotency keys.",
+    "attempted_solutions": [
+      {
+        "solution": "Generated a fresh order ID for every incoming request.",
+        "result": "This initial implementation did not replay the original order on retries; the summary does not describe a separate failed remediation."
+      }
+    ],
+    "successful_solution": "Required an idempotency key, stored normalized requests and successful responses in SQLite, replayed the original result for identical retries, returned 409 for conflicting payloads, and protected concurrent requests within one process.",
+    "outcome": "Added concurrent-retry and database-reopen replay tests; the final nine tests pass. Multi-replica coordination and real-provider reconciliation remain outside scope. Evidence: supplied repository summary identifies commit 6ead437; merged PR #7; resolved issue #3. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "A retried operation must return its original successful response and reject key reuse with different payloads. The supplied implementation applies only within a single process.",
+    "repository": "checkout-service",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "checkout-service-004",
+    "title": "Misnamed configuration silently routes staging calls to localhost",
+    "problem": "A misnamed environment variable allowed checkout to use an unintended localhost downstream address in staging.",
+    "symptoms": "The staging scenario involved silent localhost fallback; exact HTTP errors were not supplied.",
+    "root_cause": "Startup accepted missing or incorrect downstream configuration instead of failing before serving requests.",
+    "attempted_solutions": [
+      {
+        "solution": "Allowed a localhost default when downstream configuration was missing.",
+        "result": "The initial behavior hid the misnamed environment variable and selected the wrong destination; no separate failed remediation was described."
+      }
+    ],
+    "successful_solution": "Validated required downstream URLs and timeout settings at startup and supplied .env.example.",
+    "outcome": "Configuration tests were added and all nine final tests pass; the summary also notes database-handle cleanup in this commit. No deployment success-rate measurement was supplied. Evidence: supplied repository summary identifies commit 0971a88; merged PR #8; resolved issue #4. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "Service-to-service failures follow deployment configuration changes, especially when a development default masks a missing setting. Relevant to payments-api and fleetapi startup validation.",
+    "repository": "checkout-service",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "fleetapi-001",
+    "title": "Vehicle search SQL injection found during security review",
+    "problem": "Vehicle search and filtering constructed SQL using request values.",
+    "symptoms": "A security review found an injection vulnerability before any exploitation was reported.",
+    "root_cause": "Search SQL was assembled through string concatenation.",
+    "attempted_solutions": [
+      {
+        "solution": "Built search/filter SQL through string concatenation in commit bc5822f.",
+        "result": "The initial implementation introduced SQL injection; no separate failed fix was documented in the summary."
+      }
+    ],
+    "successful_solution": "Parameterized the vehicle search query.",
+    "outcome": "The fix and postmortem are recorded in commit edf6f25; regression coverage for SQL injection was later added in commit 7df5bc2. No exploitation was reported. Evidence: supplied repository summary identifies commit edf6f25. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "Request values enter SQL queries. Applicable to SQLite in checkout-service and PostgreSQL in payments-api, using each driver’s parameter syntax.",
+    "repository": "fleetapi",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "fleetapi-002",
+    "title": "Hardcoded JWT secret and non-expiring tokens require auth hardening",
+    "problem": "JWT authentication shipped with an embedded signing secret and tokens without expiration.",
+    "symptoms": "The synthetic leaked-secret incident identified the hardcoded secret and unlimited token lifetime; no exploitation or affected-token count was supplied.",
+    "root_cause": "The initial authentication implementation embedded the signing secret and omitted token expiry.",
+    "attempted_solutions": [
+      {
+        "solution": "Used a hardcoded secret and tokens that never expired in commit 7c76b77.",
+        "result": "This initial design left the signing secret exposed in source and tokens valid indefinitely; no separate failed remediation was described."
+      }
+    ],
+    "successful_solution": "Moved the signing secret into a required environment variable, rotated it, and set token expiration to eight hours.",
+    "outcome": "The fix and postmortem are recorded in commit 06d3b45. The summary does not report auth-specific test results or token revocation measurements. Evidence: supplied repository summary identifies commit 06d3b45. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "A service uses embedded signing credentials or unbounded token lifetimes; required startup configuration also relates to checkout-service’s configuration incident.",
+    "repository": "fleetapi",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "fleetapi-003",
+    "title": "Pagination skips the first page of results",
+    "problem": "List endpoint pagination omitted the first page after pagination was introduced.",
+    "symptoms": "A pilot customer reported skipped page-one results.",
+    "root_cause": "The SQL offset calculation had an off-by-one error for one-based page numbers.",
+    "attempted_solutions": [
+      {
+        "solution": "Used the original pagination offset calculation in commit 828fc4c.",
+        "result": "It skipped page one; the exact original expression and a separate attempted fix were not supplied."
+      }
+    ],
+    "successful_solution": "Computed offset as (page - 1) * limit.",
+    "outcome": "Commit ac8d95b fixes the calculation; pagination regression coverage was later added in commit 7df5bc2. No affected-row count was supplied. Evidence: supplied repository summary identifies commit ac8d95b. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "An API exposes one-based page numbers but its storage query uses zero-based offsets.",
+    "repository": "fleetapi",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "fleetapi-004",
+    "title": "Concurrent fuel logs lose odometer increments",
+    "problem": "Fuel logging updated vehicle odometers through separate read and write operations.",
+    "symptoms": "Concurrent updates produced a lost-update race; no reproduction counts were supplied.",
+    "root_cause": "Two operations could read the same previous odometer value and overwrite each other’s increments.",
+    "attempted_solutions": [
+      {
+        "solution": "Read the odometer, computed a new value, and wrote it back in commit d4f7696.",
+        "result": "The initial read-modify-write approach was not atomic and allowed lost updates; no separate failed remediation was documented."
+      }
+    ],
+    "successful_solution": "Used a single atomic UPDATE with SET odometer = odometer + ? instead of application-side read-modify-write.",
+    "outcome": "Commit 79ed109 records the fix and postmortem; race-condition regression coverage was added in commit 7df5bc2. The summary says the lost-update race was closed. Evidence: supplied repository summary identifies commit 79ed109. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "Concurrent requests increment a shared database value. This is distinct from duplicate operation replay in checkout-service; atomic increments alone do not provide idempotency.",
+    "repository": "fleetapi",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "fleetapi-005",
+    "title": "Floating-point trip billing fails finance reconciliation",
+    "problem": "Trip cost calculations and monthly reports stored and summed costs as floating-point values.",
+    "symptoms": "Finance reconciliation caught monetary discrepancies; the summary supplies no discrepancy amounts.",
+    "root_cause": "Floating-point storage and summation introduced rounding inaccuracies in monetary calculations.",
+    "attempted_solutions": [
+      {
+        "solution": "Stored and summed costs as floats in commit 52d63a6.",
+        "result": "The initial representation produced reconciliation discrepancies; no separate failed remediation was documented."
+      }
+    ],
+    "successful_solution": "Migrated monetary calculations and storage to integer cents throughout.",
+    "outcome": "Commit fa13eec records the fix and postmortem. No reconciliation totals or migration test results were supplied. Evidence: supplied repository summary identifies commit fa13eec. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "Exact monetary accumulation is required. Relevant to checkout-service and payments-api amount handling, with currency-specific minor-unit rules considered separately.",
+    "repository": "fleetapi",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "fleetapi-006",
+    "title": "N+1 driver queries cause fleet dashboard timeouts",
+    "problem": "The vehicle trips endpoint became too slow for the largest pilot customer after adding driver details.",
+    "symptoms": "Dashboard timeouts occurred for the largest pilot; GET /vehicles/:id/trips issued one driver query per trip.",
+    "root_cause": "Per-trip driver lookups caused an N+1 query pattern as trip counts grew.",
+    "attempted_solutions": [
+      {
+        "solution": "Fetched driver details separately for every trip in commit 0fc2352.",
+        "result": "The initial approach scaled query count with trip count and caused dashboard timeouts; no separate failed fix was described."
+      }
+    ],
+    "successful_solution": "Replaced per-trip lookups with a single LEFT JOIN query.",
+    "outcome": "Commit 2afd3e1 records the fix and postmortem and is described as fixing the dashboard timeouts. No latency or query-count benchmark was supplied beyond the single-query design. Evidence: supplied repository summary identifies commit 2afd3e1. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "Timeouts grow with the number of related records and queries repeat per result. Compare payments-api connection leaks and checkout-service provider latency rather than applying a generic timeout increase.",
+    "repository": "fleetapi",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "fleetapi-007",
+    "title": "Negative mileage and fuel values corrupt analytics",
+    "problem": "A buggy upstream integration submitted invalid mileage and fuel values.",
+    "symptoms": "The analytics dashboard was corrupted by negative input values; no number of affected records was supplied.",
+    "root_cause": "The API lacked validation rejecting negative mileage and fuel values.",
+    "attempted_solutions": [
+      {
+        "solution": "Accepted upstream mileage and fuel values without the missing validation.",
+        "result": "The initial behavior allowed invalid data to reach analytics; no separate failed remediation was documented."
+      }
+    ],
+    "successful_solution": "Added validation middleware rejecting negative mileage and fuel values.",
+    "outcome": "Commit b2b65a7 records the fix and postmortem; validation regression coverage was added in commit 7df5bc2. The summary does not establish that historical invalid records were repaired. Evidence: supplied repository summary identifies commit b2b65a7. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "Upstream integrations can submit syntactically valid but domain-invalid numbers. Related to amount validation in checkout-service and payments-api.",
+    "repository": "fleetapi",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "fleetapi-008",
+    "title": "Local-time timestamp parsing produces DST duration errors",
+    "problem": "The trip-end response added duration_minutes but interpreted timestamps in local time.",
+    "symptoms": "Trip durations were incorrect around daylight-saving transitions; no example timestamp pair was supplied.",
+    "root_cause": "Timestamp parsing depended on local-time interpretation rather than explicit UTC.",
+    "attempted_solutions": [
+      {
+        "solution": "Parsed trip timestamps as local time in commit 7e64edf.",
+        "result": "The original duration calculation was vulnerable to DST-related errors; no separate failed remediation was documented."
+      }
+    ],
+    "successful_solution": "Parsed timestamps explicitly as UTC for duration calculations.",
+    "outcome": "Commit 1afea0c is described as avoiding DST-related duration errors. No timezone regression test results were supplied. Evidence: supplied repository summary identifies commit 1afea0c. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "Elapsed durations are calculated from timestamps whose interpretation must remain stable across host timezones and daylight-saving changes.",
+    "repository": "fleetapi",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "fleetapi-009",
+    "title": "Invalid driver ID crashes trip start with raw SQL error",
+    "problem": "Trip start failed without a controlled validation response when driver_id was invalid.",
+    "symptoms": "The defect was found while writing tests; the previous behavior crashed with a raw SQL error.",
+    "root_cause": "The trip-start path did not validate driver_id before using it in the database operation.",
+    "attempted_solutions": [
+      {
+        "solution": "Passed driver_id into the trip-start operation without validation.",
+        "result": "The initial behavior exposed a raw SQL failure; no separate failed remediation was documented."
+      }
+    ],
+    "successful_solution": "Validated driver_id on trip start before the database operation.",
+    "outcome": "Commit e2c8018 fixes the defect identified during test development. The summary does not specify the resulting status code or full validation rules. Evidence: supplied repository summary identifies commit e2c8018. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "A reference supplied by a caller can fail database constraints and escape as an uncontrolled error. Relevant to any API accepting related-entity IDs.",
+    "repository": "fleetapi",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "fleetapi-010",
+    "title": "ADR: SQLite accepted for a single-instance MVP",
+    "problem": "The fleet backend needed a storage choice for an MVP with vehicles, drivers, trips, maintenance, and users.",
+    "symptoms": "No incident is documented for this decision; the summary explicitly identifies a single-instance tradeoff.",
+    "root_cause": "Architectural constraint: the fixture selected SQLite for its MVP and accepted a single-instance deployment boundary.",
+    "attempted_solutions": [
+      {
+        "solution": "Implemented the core schema with SQLite and better-sqlite3 in commit 082c8f3.",
+        "result": "Adopted for the MVP with the single-instance tradeoff accepted; no failed alternative is documented."
+      }
+    ],
+    "successful_solution": "Recorded the SQLite MVP decision and accepted single-instance limitation in ADR 0001. This is an accepted design, not a resolved scaling incident.",
+    "outcome": "Commit 3e830b6 records ADR 0001. No multi-instance readiness or performance outcome is claimed. Evidence: supplied repository summary identifies commit 3e830b6. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "Selecting storage for a small single-instance service; relevant to checkout-service’s SQLite replay store, whose multi-replica coordination is also outside scope.",
+    "repository": "fleetapi",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "fleetapi-011",
+    "title": "ADR: Stateless JWT authentication decision",
+    "problem": "The fleet backend needed an authentication design and a recorded rationale.",
+    "symptoms": "No separate operational incident is documented in this ADR summary. The original JWT implementation later required secret and expiry fixes.",
+    "root_cause": "Architectural decision: use stateless JWT authentication; the detailed rationale and evaluated alternatives were not included in the supplied summary.",
+    "attempted_solutions": [
+      {
+        "solution": "Introduced JWT authentication in commit 7c76b77.",
+        "result": "The approach was adopted, but its initial hardcoded secret and non-expiring tokens required the separate fix in commit 06d3b45; no rejected alternative is documented."
+      }
+    ],
+    "successful_solution": "Recorded the stateless JWT rationale in ADR 0002. Implementation hardening is captured in the separate leaked-secret precedent.",
+    "outcome": "Commit be9cfc4 records ADR 0002. This is a design record, not evidence that the original authentication implementation was secure. Evidence: supplied repository summary identifies commit be9cfc4. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "Reviewing the rationale for stateless authentication while separately checking credential management and token-expiration behavior.",
+    "repository": "fleetapi",
+    "source": "github_commit",
+    "source_url": "",
+    "verified": true
+  },
+  {
+    "id": "fleetapi-012",
+    "title": "ADR: In-memory per-IP rate limiting does not coordinate across instances",
+    "problem": "The fleet API introduced a per-IP limiter with process-local state.",
+    "symptoms": "No rate-limit outage is documented; ADR 0003 explicitly accepts that the limiter does not work across multiple instances.",
+    "root_cause": "Each process keeps its own in-memory limiter state, so the implementation does not coordinate limits between instances.",
+    "attempted_solutions": [
+      {
+        "solution": "Implemented an in-memory per-IP limiter in commit 0a195b2.",
+        "result": "Accepted for the fixture’s deployment boundary, but ineffective as a shared multi-instance limit; no failed distributed implementation is documented."
+      }
+    ],
+    "successful_solution": "Documented the limitation in ADR 0003 rather than implementing distributed coordination. No multi-instance fix is claimed.",
+    "outcome": "Commit a0b7d2e records the accepted limitation. The summary provides no quota values, load tests, or shared-store implementation. Evidence: supplied repository summary identifies commit a0b7d2e. Incident history is synthetic; source code and test outputs were not independently inspected.",
+    "applicable_when": "A process-local control is considered for replicated deployment. Relevant to checkout-service’s single-process concurrency protection, though rate limiting and idempotency enforce different guarantees.",
+    "repository": "fleetapi",
+    "source": "github_commit",
+    "source_url": "",
     "verified": true
   }
 ]
